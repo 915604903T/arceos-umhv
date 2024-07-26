@@ -113,13 +113,12 @@ impl<H: AxVMHal> axvcpu::AxArchVCpu for VCpu<H> {
 impl<H: AxVMHal> VCpu<H> {
     fn run_guest(&mut self) {
         unsafe {
-            // save host context
-            save_context();
             core::arch::asm!(
+                "bl save_context",  // save host context
                 "mov x9, sp",
                 "mov x10, {0}",
-                "str x9, [x10]",
-                in(reg) &self.host_stack_top as *const _ as *const u64,
+                "str x9, [x10]",    // save host stack top in the vcpu struct
+                in(reg) &self.host_stack_top as *const _ as usize,
                 options(nostack)
             );
             context_vm_entry(&self.host_stack_top as *const _ as usize);
@@ -235,10 +234,10 @@ impl<H: AxVMHal> VCpu<H> {
 pub unsafe extern "C" fn vmexit_aarch64_handler() {
     // save guest context
     core::arch::asm!(
-        "bl save_context",
-        "mov x0, sp",
-        "ldr x1, [x0]",
-        "mov sp, x1",
+        "bl save_context",  // save guest context
+        "mov x9, sp",
+        "ldr x10, [x9]",
+        "mov sp, x10",   // move sp to the host stack top value
         "bl restore_context", // restore host context
         "ret",
         options(noreturn),

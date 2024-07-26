@@ -1,6 +1,7 @@
 .global save_context
 save_context:
     sub     sp, sp, 34 * 8
+
     stp     x0, x1, [sp]
     stp     x2, x3, [sp, 2 * 8]
     stp     x4, x5, [sp, 4 * 8]
@@ -24,8 +25,12 @@ save_context:
     mrs     x11, spsr_el2
     stp     x10, x11, [sp, 32 * 8]
 
+    add    sp, sp, 34 * 8
+
 .global restore_context
 restore_context:
+    sub     sp, sp, 34 * 8
+
     ldp     x10, x11, [sp, 32 * 8]
     msr     elr_el2, x10
     msr     spsr_el2, x11
@@ -46,4 +51,5 @@ restore_context:
     ldp     x4, x5, [sp, 4 * 8]
     ldp     x2, x3, [sp, 2 * 8]
     ldp     x0, x1, [sp]
+
     add     sp, sp, 34 * 8
