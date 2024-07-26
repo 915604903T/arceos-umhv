@@ -1,6 +1,5 @@
 .global context_vm_entry
 context_vm_entry:
-    // mov sp, x0
     ldp     x10, x11, [x0, 32 * 8]
     msr     elr_el2, x10
     msr     spsr_el2, x11
@@ -21,5 +20,7 @@ context_vm_entry:
     ldp     x4, x5, [x0, 4 * 8]
     ldp     x2, x3, [x0, 2 * 8]
     ldp     x0, x1, [x0]
-    // add     sp, sp, 34 * 8
+
+    # keep sp as host stack top addr
+    mov     sp, x0
     eret

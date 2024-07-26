@@ -63,7 +63,7 @@ fn load_guest_image_from_file_system(file_name: &str, load_gpa: GuestPhysAddr) -
 
 pub fn setup_gpm() -> AxResult<GuestPhysMemorySet> {
     load_guest_image_from_file_system("nimbos.dtb", DTB_ENTRY)?;
-    load_guest_image_from_file_system("nimbos.bin", GUEST_ENTRY)?;
+    load_guest_image_from_file_system("nimbos.bin", GUEST_ENTRY- GUEST_PHYS_MEMORY_BASE)?;
 
     let mut guest_memory_regions: Vec<GuestMemoryRegion> = vec![];
     let mut gpm = GuestPhysMemorySet::new()?;
@@ -72,7 +72,7 @@ pub fn setup_gpm() -> AxResult<GuestPhysMemorySet> {
     guest_memory_regions.push(GuestMemoryRegion {
         gpa: GUEST_PHYS_MEMORY_BASE,
         hpa: virt_to_phys(HostVirtAddr::from(
-            gpa_as_mut_ptr(GUEST_PHYS_MEMORY_BASE) as usize
+            gpa_as_mut_ptr(0) as usize
         )),
         size: GUEST_PHYS_MEMORY_SIZE,
         flags: MappingFlags::READ | MappingFlags::WRITE | MappingFlags::EXECUTE,
