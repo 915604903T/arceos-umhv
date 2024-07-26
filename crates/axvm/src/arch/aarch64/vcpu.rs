@@ -1,7 +1,5 @@
-use alloc::vec::Vec;
 use core::arch::global_asm;
 use core::marker::PhantomData;
-use core::mem::size_of;
 use spin::Mutex;
 
 use axvcpu::AxArchVCpuExitReason;
@@ -9,30 +7,19 @@ use cortex_a::registers::*;
 use tock_registers::interfaces::*;
 
 use super::context_frame::VmContext;
-use super::register_lower_aarch64_synchronous_handler;
+use super::exception_utils::*;
+use super::register_lower_aarch64_synchronous_handler_arch;
+use super::sync::{data_abort_handler, hvc_handler};
 use super::ContextFrame;
 use axerrno::{AxError, AxResult};
 
 use crate::{AxVMHal, GuestPhysAddr, HostPhysAddr};
 
-core::arch::global_asm!(include_str!("entry.S"));
-// use crate::arch::hvc::run_guest_by_trap2el2;
+global_asm!(include_str!("entry.S"));
+global_asm!(include_str!("exception.S"));
 
 // TSC, bit [19]
 const HCR_TSC_TRAP: usize = 1 << 19;
-
-/// Vcpu State
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum VcpuState {
-    /// Invalid
-    Inv = 0,
-    /// Runnable
-    Runnable = 1,
-    /// Running
-    Running = 2,
-    /// Blocked
-    Blocked = 3,
-}
 
 /// (v)CPU register state that must be saved or restored when entering/exiting a VM or switching
 /// between VMs.
@@ -59,37 +46,40 @@ impl VmCpuRegisters {
 #[derive(Clone, Debug)]
 pub struct VCpu<H: AxVMHal> {
     /// Vcpu context
-    pub regs: VmCpuRegisters,
+    ctx: ContextFrame,
+    host_stack_top: u64,
+    system_regs: VmContext,
     vcpu_id: usize,
 
     marker: PhantomData<H>,
 }
 
 extern "C" {
-    fn context_vm_entry(ctx: usize) -> !;
+    fn context_vm_entry(ctx: usize);
+    fn save_context();
+    fn restore_context();
 }
 
 pub type AxArchVCpuConfig = VmCpuRegisters;
 
-// Public Function
 impl<H: AxVMHal> axvcpu::AxArchVCpu for VCpu<H> {
     type CreateConfig = ();
 
     type SetupConfig = ();
 
     fn new(_config: Self::CreateConfig) -> AxResult<Self> {
-        // Self {
-        //     regs: VmCpuRegisters::default(),
-        //     marker: PhantomData,
-        // }
         Ok(Self {
-            regs: AxArchVCpuConfig::default(),
+            ctx: ContextFrame::default(),
+            host_stack_top: 0,
+            system_regs: VmContext::default(),
             vcpu_id: 0, // need to pass a parameter!!!!
             marker: PhantomData,
         })
     }
 
     fn setup(&mut self, _config: Self::SetupConfig) -> AxResult {
+        register_lower_aarch64_synchronous_handler_arch()?;
+        self.init_hv();
         Ok(())
     }
 
@@ -101,17 +91,13 @@ impl<H: AxVMHal> axvcpu::AxArchVCpu for VCpu<H> {
 
     fn set_ept_root(&mut self, ept_root: HostPhysAddr) -> AxResult {
         debug!("set vcpu ept root:{:#x}", ept_root);
-        self.regs.vm_system_regs.vttbr_el2 = ept_root.as_usize() as u64;
+        self.system_regs.vttbr_el2 = ept_root.as_usize() as u64;
         Ok(())
     }
 
     fn run(&mut self) -> AxResult<AxArchVCpuExitReason> {
-        register_lower_aarch64_synchronous_handler()?;
-        self.init_hv();
-        unsafe {
-            context_vm_entry(self.vcpu_trap_ctx_addr());
-        }
-        Err(AxError::BadState)
+        self.run_guest();
+        self.vmexit_handler()
     }
 
     fn bind(&mut self) -> AxResult {
@@ -125,8 +111,53 @@ impl<H: AxVMHal> axvcpu::AxArchVCpu for VCpu<H> {
 
 // Private function
 impl<H: AxVMHal> VCpu<H> {
+    fn run_guest(&mut self) {
+        unsafe {
+            // save host context
+            save_context();
+            core::arch::asm!(
+                "mov x9, sp",
+                "mov x10, {0}",
+                "str x9, [x10]",
+                in(reg) &self.host_stack_top as *const _ as *const u64,
+                options(nostack)
+            );
+            context_vm_entry(&self.host_stack_top as *const _ as usize);
+        }
+    }
+
+    fn vmexit_handler(&mut self) -> AxResult<AxArchVCpuExitReason> {
+        debug!(
+            "enter lower_aarch64_synchronous exception class:0x{:X}",
+            exception_class()
+        );
+        let ctx = &mut self.ctx;
+        match exception_class() {
+            0x24 => {
+                // device_list handler
+                return data_abort_handler(ctx);
+            }
+            0x16 => return hvc_handler(ctx),
+            // 0x18 todo？
+            _ => {
+                panic!(
+                    "handler not presents for EC_{} @ipa 0x{:x}, @pc 0x{:x}, @esr 0x{:x}, @sctlr_el1 0x{:x}, @vttbr_el2 0x{:x}, @vtcr_el2: {:#x} hcr: {:#x} ctx:{}",
+                    exception_class(),
+                    exception_fault_addr(),
+                    (*ctx).exception_pc(),
+                    exception_esr(),
+                    cortex_a::registers::SCTLR_EL1.get() as usize,
+                    cortex_a::registers::VTTBR_EL2.get() as usize,
+                    cortex_a::registers::VTCR_EL2.get() as usize,
+                    cortex_a::registers::HCR_EL2.get() as usize,
+                    ctx
+                );
+            }
+        }
+    }
+
     fn init_hv(&mut self) {
-        self.regs.trap_context_regs.spsr = (SPSR_EL1::M::EL1h
+        self.ctx.spsr = (SPSR_EL1::M::EL1h
             + SPSR_EL1::I::Masked
             + SPSR_EL1::F::Masked
             + SPSR_EL1::A::Masked
@@ -141,7 +172,7 @@ impl<H: AxVMHal> VCpu<H> {
                 msr cptr_el2, x3"
             );
         }
-        self.regs.vm_system_regs.ext_regs_restore();
+        self.system_regs.ext_regs_restore();
         unsafe {
             cache_invalidate(0 << 1);
             cache_invalidate(1 << 1);
@@ -159,58 +190,59 @@ impl<H: AxVMHal> VCpu<H> {
     /// Init guest context. Also set some el2 register value.
     fn init_vm_context(&mut self) {
         CNTHCTL_EL2.modify(CNTHCTL_EL2::EL1PCEN::SET + CNTHCTL_EL2::EL1PCTEN::SET);
-        self.regs.vm_system_regs.cntvoff_el2 = 0;
-        self.regs.vm_system_regs.cntkctl_el1 = 0;
+        self.system_regs.cntvoff_el2 = 0;
+        self.system_regs.cntkctl_el1 = 0;
 
-        self.regs.vm_system_regs.sctlr_el1 = 0x30C50830;
-        self.regs.vm_system_regs.pmcr_el0 = 0;
-        // self.regs.vm_system_regs.vtcr_el2 = 0x8001355c;
-        self.regs.vm_system_regs.vtcr_el2 =
-            (VTCR_EL2::PS::PA_40B_1TB   // 40bit PA, 1TB
-                                          + VTCR_EL2::TG0::Granule4KB
-                                          + VTCR_EL2::SH0::Inner
-                                          + VTCR_EL2::ORGN0::NormalWBRAWA
-                                          + VTCR_EL2::IRGN0::NormalWBRAWA
-                                          + VTCR_EL2::SL0.val(0b01)
-                                          + VTCR_EL2::T0SZ.val(64 - 39))
-            .into();
-        self.regs.vm_system_regs.hcr_el2 = (HCR_EL2::VM::Enable + HCR_EL2::RW::EL1IsAarch64).into();
-        // self.regs.vm_system_regs.hcr_el2 |= 1<<27;
+        self.system_regs.sctlr_el1 = 0x30C50830;
+        self.system_regs.pmcr_el0 = 0;
+        self.system_regs.vtcr_el2 = (VTCR_EL2::PS::PA_40B_1TB
+            + VTCR_EL2::TG0::Granule4KB
+            + VTCR_EL2::SH0::Inner
+            + VTCR_EL2::ORGN0::NormalWBRAWA
+            + VTCR_EL2::IRGN0::NormalWBRAWA
+            + VTCR_EL2::SL0.val(0b01)
+            + VTCR_EL2::T0SZ.val(64 - 39))
+        .into();
+        self.system_regs.hcr_el2 = (HCR_EL2::VM::Enable + HCR_EL2::RW::EL1IsAarch64).into();
+        // self.system_regs.hcr_el2 |= 1<<27;
         // + HCR_EL2::IMO::EnableVirtualIRQ).into();
         // trap el1 smc to el2
-        // self.regs.vm_system_regs.hcr_el2 |= HCR_TSC_TRAP as u64;
+        // self.system_regs.hcr_el2 |= HCR_TSC_TRAP as u64;
 
         let mut vmpidr = 0;
         vmpidr |= 1 << 31;
         vmpidr |= self.vcpu_id;
-        self.regs.vm_system_regs.vmpidr_el2 = vmpidr as u64;
-        // self.gic_ctx_reset(); // because of passthrough gic, do not need gic context anymore?
-    }
-
-    /// Get vcpu whole context address
-    fn vcpu_ctx_addr(&self) -> usize {
-        &(self.regs) as *const _ as usize
-    }
-
-    /// Get vcpu trap context for guest or arceos
-    fn vcpu_trap_ctx_addr(&self) -> usize {
-        &(self.regs.trap_context_regs) as *const _ as usize
+        self.system_regs.vmpidr_el2 = vmpidr as u64;
     }
 
     /// Set exception return pc
     fn set_elr(&mut self, elr: usize) {
-        self.regs.trap_context_regs.set_exception_pc(elr);
+        self.ctx.set_exception_pc(elr);
     }
 
     /// Get general purpose register
     fn get_gpr(&mut self, idx: usize) {
-        self.regs.trap_context_regs.gpr(idx);
+        self.ctx.gpr(idx);
     }
 
     /// Set general purpose register
     fn set_gpr(&mut self, idx: usize, val: usize) {
-        self.regs.trap_context_regs.set_gpr(idx, val);
+        self.ctx.set_gpr(idx, val);
     }
+}
+
+#[naked]
+pub unsafe extern "C" fn vmexit_aarch64_handler() {
+    // save guest context
+    core::arch::asm!(
+        "bl save_context",
+        "mov x0, sp",
+        "ldr x1, [x0]",
+        "mov sp, x1",
+        "bl restore_context", // restore host context
+        "ret",
+        options(noreturn),
+    )
 }
 
 unsafe fn cache_invalidate(cache_level: usize) {
