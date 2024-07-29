@@ -26,6 +26,7 @@ save_context:
     stp     x10, x11, [sp, 32 * 8]
 
     add    sp, sp, 34 * 8
+    ret
 
 .global restore_context
 restore_context:
@@ -53,3 +54,4 @@ restore_context:
     ldp     x0, x1, [sp]
 
     add     sp, sp, 34 * 8
+    ret

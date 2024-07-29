@@ -94,8 +94,9 @@ impl<H: AxVMHal> axvcpu::AxArchVCpu for VCpu<H> {
         self.system_regs.vttbr_el2 = ept_root.as_usize() as u64;
         Ok(())
     }
-
+    
     fn run(&mut self) -> AxResult<AxArchVCpuExitReason> {
+        mark();
         self.run_guest();
         self.vmexit_handler()
     }
@@ -109,8 +110,15 @@ impl<H: AxVMHal> axvcpu::AxArchVCpu for VCpu<H> {
     }
 }
 
+#[no_mangle]
+#[inline(never)]
+fn mark() {
+    debug!("mark");
+}
+
 // Private function
 impl<H: AxVMHal> VCpu<H> {
+    #[inline(never)]
     fn run_guest(&mut self) {
         unsafe {
             core::arch::asm!(
@@ -118,10 +126,12 @@ impl<H: AxVMHal> VCpu<H> {
                 "mov x9, sp",
                 "mov x10, {0}",
                 "str x9, [x10]",    // save host stack top in the vcpu struct
+                "mov x0, {0}",
+                "b context_vm_entry",
                 in(reg) &self.host_stack_top as *const _ as usize,
                 options(nostack)
             );
-            context_vm_entry(&self.host_stack_top as *const _ as usize);
+            // context_vm_entry(&self.host_stack_top as *const _ as usize);
         }
     }
 
