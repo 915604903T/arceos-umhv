@@ -1,6 +1,7 @@
 mod context_frame;
 pub mod device_list;
 mod ept;
+#[macro_use]
 mod exception_utils;
 mod hvc;
 mod pcpu;

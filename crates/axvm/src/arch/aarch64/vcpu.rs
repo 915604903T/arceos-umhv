@@ -16,7 +16,6 @@ use axerrno::{AxError, AxResult};
 use crate::{AxVMHal, GuestPhysAddr, HostPhysAddr};
 
 global_asm!(include_str!("entry.S"));
-global_asm!(include_str!("exception.S"));
 
 // TSC, bit [19]
 const HCR_TSC_TRAP: usize = 1 << 19;
@@ -56,8 +55,6 @@ pub struct VCpu<H: AxVMHal> {
 
 extern "C" {
     fn context_vm_entry(ctx: usize);
-    fn save_context();
-    fn restore_context();
 }
 
 pub type AxArchVCpuConfig = VmCpuRegisters;
@@ -94,9 +91,9 @@ impl<H: AxVMHal> axvcpu::AxArchVCpu for VCpu<H> {
         self.system_regs.vttbr_el2 = ept_root.as_usize() as u64;
         Ok(())
     }
-    
+
     fn run(&mut self) -> AxResult<AxArchVCpuExitReason> {
-        mark();
+        self.restore_vm_system_regs();
         self.run_guest();
         self.vmexit_handler()
     }
@@ -110,37 +107,13 @@ impl<H: AxVMHal> axvcpu::AxArchVCpu for VCpu<H> {
     }
 }
 
-#[no_mangle]
-#[inline(never)]
-fn mark() {
-    debug!("mark");
-}
-
 // Private function
 impl<H: AxVMHal> VCpu<H> {
     #[inline(never)]
     fn run_guest(&mut self) {
         unsafe {
-            // load system regs
             core::arch::asm!(
-                "
-                mov x3, xzr           // Trap nothing from EL1 to El2.
-                msr cptr_el2, x3"
-            );
-            self.system_regs.ext_regs_restore();
-            cache_invalidate(0 << 1);
-            cache_invalidate(1 << 1);
-            core::arch::asm!(
-                "
-                ic  iallu
-                tlbi	alle2
-                tlbi	alle1         // Flush tlb
-                dsb	nsh
-                isb"
-            );
-
-            core::arch::asm!(
-                "bl save_context",  // save host context
+                save_regs_to_stack!(),  // save host context
                 "mov x9, sp",
                 "mov x10, {0}",
                 "str x9, [x10]",    // save host stack top in the vcpu struct
@@ -153,14 +126,35 @@ impl<H: AxVMHal> VCpu<H> {
         }
     }
 
+    fn restore_vm_system_regs(&mut self) {
+        unsafe {
+            // load system regs
+            core::arch::asm!(
+                "
+                mov x3, xzr           // Trap nothing from EL1 to El2.
+                msr cptr_el2, x3"
+            );
+            self.system_regs.ext_regs_restore();
+            core::arch::asm!(
+                "
+                ic  iallu
+                tlbi	alle2
+                tlbi	alle1         // Flush tlb
+                dsb	nsh
+                isb"
+            );
+        }
+    }
+
     fn vmexit_handler(&mut self) -> AxResult<AxArchVCpuExitReason> {
         debug!(
-            "enter lower_aarch64_synchronous exception class:0x{:X}",
-            exception_class()
+            "enter lower_aarch64_synchronous exception class:0x{:X} ctx:{:#x?}",
+            exception_class(),
+            self.ctx
         );
         // save system regs
         self.system_regs.ext_regs_store();
-        
+
         let ctx = &mut self.ctx;
         match exception_class() {
             0x24 => return data_abort_handler(ctx),
@@ -241,47 +235,12 @@ impl<H: AxVMHal> VCpu<H> {
 pub unsafe extern "C" fn vmexit_aarch64_handler() {
     // save guest context
     core::arch::asm!(
-        "bl save_context", // save guest context
+        "add sp, sp, 34 * 8", // skip the exception frame
         "mov x9, sp",
         "ldr x10, [x9]",
-        "mov sp, x10",        // move sp to the host stack top value
-        "bl restore_context", // restore host context
+        "mov sp, x10",            // move sp to the host stack top value
+        restore_regs_to_stack!(), // restore host context
         "ret",
         options(noreturn),
     )
-}
-
-unsafe fn cache_invalidate(cache_level: usize) {
-    core::arch::asm!(
-        r#"
-        msr csselr_el1, {0}
-        mrs x4, ccsidr_el1 // read cache size id.
-        and x0, x4, #0x7
-        add x0, x0, #0x4 // x0 = cache line size.
-        ldr x3, =0x7fff
-        and x2, x3, x4, lsr #13 // x2 = cache set number – 1.
-        ldr x3, =0x3ff
-        and x3, x3, x4, lsr #3 // x3 = cache associativity number – 1.
-        clz w4, w3 // x4 = way position in the cisw instruction.
-        mov x5, #0 // x5 = way counter way_loop.
-    // way_loop:
-    1:
-        mov x6, #0 // x6 = set counter set_loop.
-    // set_loop:
-    2:
-        lsl x7, x5, x4
-        orr x7, {0}, x7 // set way.
-        lsl x8, x6, x0
-        orr x7, x7, x8 // set set.
-        dc csw, x7 // clean and invalidate cache line.
-        add x6, x6, #1 // increment set counter.
-        cmp x6, x2 // last set reached yet?
-        ble 2b // if not, iterate set_loop,
-        add x5, x5, #1 // else, next way.
-        cmp x5, x3 // last way reached yet?
-        ble 1b // if not, iterate way_loop
-        "#,
-        in(reg) cache_level,
-        options(nostack)
-    );
 }
