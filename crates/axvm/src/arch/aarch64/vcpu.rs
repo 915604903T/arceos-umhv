@@ -113,6 +113,24 @@ impl<H: AxVMHal> axvcpu::AxArchVCpu for VCpu<H> {
 impl<H: AxVMHal> VCpu<H> {
     fn run_guest(&mut self) {
         unsafe {
+            // load system regs
+            core::arch::asm!(
+                "
+                mov x3, xzr           // Trap nothing from EL1 to El2.
+                msr cptr_el2, x3"
+            );
+            self.system_regs.ext_regs_restore();
+            cache_invalidate(0 << 1);
+            cache_invalidate(1 << 1);
+            core::arch::asm!(
+                "
+                ic  iallu
+                tlbi	alle2
+                tlbi	alle1         // Flush tlb
+                dsb	nsh
+                isb"
+            );
+
             core::arch::asm!(
                 "bl save_context",  // save host context
                 "mov x9, sp",
@@ -121,6 +139,7 @@ impl<H: AxVMHal> VCpu<H> {
                 in(reg) &self.host_stack_top as *const _ as usize,
                 options(nostack)
             );
+
             context_vm_entry(&self.host_stack_top as *const _ as usize);
         }
     }
@@ -130,12 +149,12 @@ impl<H: AxVMHal> VCpu<H> {
             "enter lower_aarch64_synchronous exception class:0x{:X}",
             exception_class()
         );
+        // save system regs
+        self.system_regs.ext_regs_save();
+        
         let ctx = &mut self.ctx;
         match exception_class() {
-            0x24 => {
-                // device_list handler
-                return data_abort_handler(ctx);
-            }
+            0x24 => return data_abort_handler(ctx),
             0x16 => return hvc_handler(ctx),
             // 0x18 todo？
             _ => {
@@ -163,27 +182,6 @@ impl<H: AxVMHal> VCpu<H> {
             + SPSR_EL1::D::Masked)
             .value;
         self.init_vm_context();
-
-        unsafe {
-            core::arch::asm!(
-                "
-                mov x3, xzr           // Trap nothing from EL1 to El2.
-                msr cptr_el2, x3"
-            );
-        }
-        self.system_regs.ext_regs_restore();
-        unsafe {
-            cache_invalidate(0 << 1);
-            cache_invalidate(1 << 1);
-            core::arch::asm!(
-                "
-                ic  iallu
-                tlbi	alle2
-                tlbi	alle1         // Flush tlb
-                dsb	nsh
-                isb"
-            );
-        }
     }
 
     /// Init guest context. Also set some el2 register value.
@@ -234,10 +232,10 @@ impl<H: AxVMHal> VCpu<H> {
 pub unsafe extern "C" fn vmexit_aarch64_handler() {
     // save guest context
     core::arch::asm!(
-        "bl save_context",  // save guest context
+        "bl save_context", // save guest context
         "mov x9, sp",
         "ldr x10, [x9]",
-        "mov sp, x10",   // move sp to the host stack top value
+        "mov sp, x10",        // move sp to the host stack top value
         "bl restore_context", // restore host context
         "ret",
         options(noreturn),
