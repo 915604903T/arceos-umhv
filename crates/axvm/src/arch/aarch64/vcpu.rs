@@ -159,7 +159,7 @@ impl<H: AxVMHal> VCpu<H> {
             exception_class()
         );
         // save system regs
-        self.system_regs.ext_regs_save();
+        self.system_regs.ext_regs_store();
         
         let ctx = &mut self.ctx;
         match exception_class() {
